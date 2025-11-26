@@ -1,40 +1,105 @@
-"""FFmpeg execution and process management.
+import os
+import subprocess
+import time
+from typing import Callable
 
-This module will gradually absorb ffmpeg-related logic from golden_anchor/pubg_hevc_gui.py,
-preserving behavior exactly while improving structure and testability.
-"""
+from .model import JobModel
+from .settings import load_settings
 
-from typing import List, Dict, Optional
+settings = load_settings()
+ffmpeg_path = settings.get("ffmpeg_path") or r"C:\\ffmpeg\\bin\\ffmpeg.exe"
 
-
-class FFmpegJob(object):
-    """Represents a single ffmpeg encoding job."""
-
-    def __init__(self, input_path: str, output_path: str, command: List[str]):
-        self.input_path = input_path
-        self.output_path = output_path
-        self.command = command
-        self.process = None
-        self.returncode = None
-        self.progress = 0.0
-        self.eta_seconds = None  # type: Optional[float]
+ProgressCallback = Callable[[JobModel, float, float], None]
 
 
-def build_ffmpeg_command(input_path: str, output_path: str, template: str) -> List[str]:
-    """Build the ffmpeg command list from a template.
-
-    This is a placeholder. The real implementation will be ported from the
-    golden anchor while keeping the exact behavior and defaults.
+def build_ffmpeg_command(job: JobModel, ffmpeg_path: str) -> list:
     """
-    # TODO: Implement using golden anchor logic.
-    return ["ffmpeg", "-i", input_path, output_path]
-
-
-def run_ffmpeg_job(job: FFmpegJob) -> int:
-    """Run a single ffmpeg job synchronously.
-
-    In the final architecture this will be driven from a worker thread.
+    Return the exact NVENC command from the golden anchor EncoderWorker.run(),
+    expressed as a list of arguments.
     """
-    # TODO: Port process execution, logging, and progress parsing from golden anchor.
-    raise NotImplementedError("run_ffmpeg_job is not implemented yet.")
+    return [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        job.input_path,
+        "-c:v",
+        "hevc_nvenc",
+        "-preset",
+        "p7",
+        "-profile:v",
+        "main",
+        "-rc",
+        "vbr",
+        "-cq",
+        "23",
+        "-g",
+        "10",
+        "-keyint_min",
+        "10",
+        "-rc-lookahead",
+        "20",
+        "-spatial-aq",
+        "1",
+        "-aq-strength",
+        "15",
+        "-temporal-aq",
+        "1",
+        "-c:a",
+        "copy",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-loglevel",
+        "error",
+        job.output_path,
+    ]
 
+
+def run_ffmpeg_job(job: JobModel, on_progress: ProgressCallback) -> bool:
+    """
+    Run ffmpeg synchronously for the given job.
+
+    Behavior must exactly reproduce EncoderWorker.run() from pubg_hevc_gui.py.
+    """
+    job.start_time = time.time()
+
+    cmd = build_ffmpeg_command(job, ffmpeg_path)
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1,
+        )
+    except Exception:
+        return False
+
+    duration_sec = job.duration if getattr(job, "duration", 0) > 0 else None
+
+    if process.stdout is not None:
+        for line in process.stdout:
+            line = line.strip()
+            if line.startswith("out_time_ms="):
+                try:
+                    ms = int(line.split("=", 1)[1])
+                    position_sec = ms / 1_000_000.0
+                    job.last_position_sec = position_sec
+                    if duration_sec and duration_sec > 0:
+                        progress = min(position_sec / duration_sec, 1.0)
+                    else:
+                        progress = 0.0
+                    job.progress = progress
+                    on_progress(job, progress, position_sec)
+                except ValueError:
+                    continue
+
+    process.wait()
+    success = process.returncode == 0 and os.path.exists(job.output_path)
+
+    if success:
+        job.progress = 1.0
+        on_progress(job, 1.0, getattr(job, "duration", 0.0))
+
+    return success
